@@ -1,0 +1,344 @@
+# ============================================================
+# Docker Compose: Order Platform Infrastructure
+# ============================================================
+
+services:
+  # ─────────────────────────────────────────────────
+  # PostgreSQL — Primary Datastore
+  # ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: op-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: orderplatform
+      POSTGRES_PASSWORD: orderplatform_dev
+      POSTGRES_DB: order_platform
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderplatform -d order_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────
+  # Redis — Coordination, Caching, Locks & SSE Pub/Sub
+  # ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: op-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─────────────────────────────────────────────────
+  # Kafka — Event Bus (KRaft mode)
+  # ─────────────────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: op-kafka
+    ports:
+      - "29092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────
+  # Kafka Init — Topic Provisioning
+  # ─────────────────────────────────────────────────
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: op-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Creating Kafka topics..."
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic order-events \
+          --partitions 3 \
+          --replication-factor 1
+        echo "✅ Created topic: order-events (3 partitions)"
+
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic order-events-dlq \
+          --partitions 1 \
+          --replication-factor 1
+        echo "✅ Created topic: order-events-dlq (1 partition - Dead Letter Queue)"
+
+        echo ""
+        echo "All topics:"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+        echo "Done."
+    restart: "no"
+
+  # ─────────────────────────────────────────────────
+  # Kafka UI — Visual Dashboard
+  # ─────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: op-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: order-platform
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────────
+  # Order API — HTTP Server + Outbox Relay
+  # ─────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: op-app
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
+      DB_POOL_MIN: 2
+      DB_POOL_MAX: 10
+      LOG_LEVEL: debug
+      NOTIFICATION_DELAY_MS: 500
+      NOTIFICATION_FAILURE_RATE: 0.0
+      # Kafka configuration (for outbox relay)
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: order-api
+      KAFKA_TOPIC_ORDER_EVENTS: order-events
+      KAFKA_TOPIC_DLQ: order-events-dlq
+      # Outbox relay configuration
+      OUTBOX_POLL_INTERVAL_MS: 1000
+      OUTBOX_BATCH_SIZE: 50
+      # Redis configuration
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "op:"
+      # Rate limiting
+      RATE_LIMIT_WINDOW_MS: 60000
+      RATE_LIMIT_MAX_REQUESTS: 30
+      # Cache
+      CACHE_ORDER_TTL_SECONDS: 60
+      # Leader election
+      LEADER_ELECTION_LEASE_TTL_MS: 15000
+      LEADER_ELECTION_HEARTBEAT_MS: 5000
+      # SSE configuration
+      SSE_HEARTBEAT_INTERVAL_MS: 15000
+      SSE_MAX_CONNECTIONS_PER_ORDER: 10
+      SSE_MAX_TOTAL_CONNECTIONS: 1000
+      SSE_BACKPRESSURE_HIGH_WATER_MARK: 65536
+      SSE_BACKPRESSURE_CRITICAL_MARK: 262144
+      SSE_CLIENT_RETRY_MS: 3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ─────────────────────────────────────────────────
+  # Notification Consumers — Consumer Group (3 instances)
+  # ─────────────────────────────────────────────────
+  notification-consumer-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: op-notification-consumer-1
+    command: ["node", "dist/consumers/index.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
+      DB_POOL_MIN: 1
+      DB_POOL_MAX: 3
+      LOG_LEVEL: debug
+      NOTIFICATION_DELAY_MS: 500
+      NOTIFICATION_FAILURE_RATE: 0.0
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: notification-consumer-1
+      KAFKA_CONSUMER_GROUP_ID: notification-service
+      KAFKA_TOPIC_ORDER_EVENTS: order-events
+      KAFKA_TOPIC_DLQ: order-events-dlq
+      CONSUMER_MAX_RETRIES: 3
+      CONSUMER_RETRY_BASE_DELAY_MS: 1000
+      # Redis for SSE Pub/Sub
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "op:"
+      # Metrics
+      CONSUMER_METRICS_PORT: 9464
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+  
+  # ─────────────────────────────────────────────────
+  # Notification Consumer 2
+  # ─────────────────────────────────────────────────
+  notification-consumer-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: op-notification-consumer-2
+    command: ["node", "dist/consumers/index.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
+      DB_POOL_MIN: 1
+      DB_POOL_MAX: 3
+      LOG_LEVEL: debug
+      NOTIFICATION_DELAY_MS: 500
+      NOTIFICATION_FAILURE_RATE: 0.0
+      # Kafka configuration
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: notification-consumer-2
+      KAFKA_CONSUMER_GROUP_ID: notification-service
+      KAFKA_TOPIC_ORDER_EVENTS: order-events
+      KAFKA_TOPIC_DLQ: order-events-dlq
+      # Retry configuration
+      CONSUMER_MAX_RETRIES: 3
+      CONSUMER_RETRY_BASE_DELAY_MS: 1000
+      # Redis for SSE Pub/Sub
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "op:"
+      # Metrics
+      CONSUMER_METRICS_PORT: 9464
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ─────────────────────────────────────────────────
+  # Notification Consumer 3
+  # ─────────────────────────────────────────────────
+  notification-consumer-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: op-notification-consumer-3
+    command: ["node", "dist/consumers/index.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://orderplatform:orderplatform_dev@postgres:5432/order_platform
+      DB_POOL_MIN: 1
+      DB_POOL_MAX: 3
+      LOG_LEVEL: debug
+      NOTIFICATION_DELAY_MS: 500
+      NOTIFICATION_FAILURE_RATE: 0.0
+      # Kafka configuration
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: notification-consumer-3
+      KAFKA_CONSUMER_GROUP_ID: notification-service
+      KAFKA_TOPIC_ORDER_EVENTS: order-events
+      KAFKA_TOPIC_DLQ: order-events-dlq
+      # Retry configuration
+      CONSUMER_MAX_RETRIES: 3
+      CONSUMER_RETRY_BASE_DELAY_MS: 1000
+      # Redis for SSE Pub/Sub
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "op:"
+      # Metrics
+      CONSUMER_METRICS_PORT: 9464
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ─────────────────────────────────────────────────
+  # Prometheus — Metrics Time-Series Database
+  # ─────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: op-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - app
+  
+  # ─────────────────────────────────────────────────
+  # Grafana — Visualization & Dashboards
+  # ─────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: op-grafana
+    ports:
+      - "4000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+    driver: local
