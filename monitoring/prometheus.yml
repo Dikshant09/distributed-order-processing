@@ -1,0 +1,38 @@
+# ============================================================
+# Prometheus Configuration
+# ============================================================
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'order-api'
+    static_configs:
+      - targets: ['app:3000']
+        labels:
+          service: 'order-platform'
+          component: 'api'
+  
+  - job_name: 'notification-consumer'
+    static_configs:
+      - targets: ['notification-consumer-1:9464']
+        labels:
+          service: 'order-platform'
+          component: 'consumer'
+          instance_id: '1'
+      - targets: ['notification-consumer-2:9464']
+        labels:
+          service: 'order-platform'
+          component: 'consumer'
+          instance_id: '2'
+      - targets: ['notification-consumer-3:9464']
+        labels:
+          service: 'order-platform'
+          component: 'consumer'
+          instance_id: '3'
+    
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
